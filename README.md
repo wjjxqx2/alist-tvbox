@@ -6,6 +6,21 @@ docker run -d -p 4566:4567 --restart=always --name=alist-tvbox \
   -v /opt/xiaoya:/www \
   ghcr.io/wjjxqx/alist-tvbox:latest
 
+
+  请从Docker日志搜索“密码”或者安装目录的initial_admin_credentials.txt文件查看密码：
+
+cat /opt/alist-tvbox/initial_admin_credentials.txt
+
+或者查看容器内文件：
+
+docker exec -it alist-tvbox cat /data/initial_admin_credentials.txt
+
+docker exec -it xiaoya-tvbox cat /data/initial_admin_credentials.txt
+
+如果找不到密码，ssh到系统运行：sudo bash -c "$(curl -fsSL http://d.har01d.cn/alist-tvbox.sh)" ，选择菜单8和8，重置密码。
+
+WebDAV使用配置页面设置的用户名和密码。
+
 # Alist-TVBox
 
 > 基于 [alist-tvbox](https://github.com/wjjxqx2/alist-tvbox) 的 **一键 Docker 部署脚本**  
