@@ -1,3 +1,64 @@
+docker pull ghcr.io/wjjxqx2/alist-tvbox:latest
+
+docker run -d -p 4566:4567 --restart=always --name=alist-tvbox \
+  -v /opt/xiaoya:/www/static \
+  -v /opt/xiaoya:/opt/alist/data \
+  -v /opt/xiaoya:/www \
+  ghcr.io/wjjxqx/alist-tvbox:latest
+
+# Alist-TVBox
+
+> 基于 [alist-tvbox](https://github.com/wjjxqx2/alist-tvbox) 的 **一键 Docker 部署脚本**  
+> 适用于 **OpenWrt / Linux / ARM / x86**  
+> 支持 **Alist + TVBox 数据源一键整合**
+
+---
+
+## 📦 项目简介
+
+`alist-tvbox` 是一个将 **Alist** 与 **TVBox** 生态结合的项目，  
+通过 Docker 一键部署，即可在局域网内提供：
+
+- Alist 文件列表服务
+- TVBox 可用接口
+- Web 管理面板
+- 自动重启、持久化存储
+
+本项目提供 **GitHub 一键安装脚本**，适合：
+
+- OpenWrt 路由器
+- 软路由（x86 / ARM）
+- Linux 服务器 / 开发板
+
+---
+
+## ✨ 功能特点
+
+- ✅ 一键安装，无需手动 `chmod`
+- ✅ 自动拉取 `ghcr.io/wjjxqx2/alist-tvbox:latest`
+- ✅ 自动创建容器并映射端口
+- ✅ 自动清理旧容器（支持重复执行）
+- ✅ 自动尝试启动 Docker（`dockerd`）
+- ✅ 支持 OpenWrt / Debian / Ubuntu / Alpine
+- ✅ 数据持久化（/opt/xiaoya）
+- ✅ 容器异常自动重启
+
+---
+
+## 🚀 一键安装（推荐）
+
+### 方法一：curl（GitHub）
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/wjjxqx2/alist-tvbox/master/install_alist_tvbox.sh )"
+
+sh -c "$(curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/wjjxqx2/alist-tvbox/master/install_alist_tvbox.sh )"
+
+sh -c "$(wget -qO- https://raw.githubusercontent.com/wjjxqx2/alist-tvbox/master/install_alist_tvbox.sh )"
+
+
+
+
+
+
 ![GitHub Repo stars](https://img.shields.io/github/stars/power721/alist-tvbox?style=for-the-badge)
 ![GitHub forks](https://img.shields.io/github/forks/power721/alist-tvbox?style=for-the-badge)
 ![GitHub contributors](https://img.shields.io/github/contributors/power721/alist-tvbox?style=for-the-badge)
