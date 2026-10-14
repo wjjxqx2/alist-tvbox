@@ -72,6 +72,7 @@ import cn.har01d.alist_tvbox.tvbox.MovieDetail;
 import cn.har01d.alist_tvbox.tvbox.MovieList;
 import cn.har01d.alist_tvbox.util.BiliBiliUtils;
 import cn.har01d.alist_tvbox.util.BiliCookieRefreshUtils;
+import cn.har01d.alist_tvbox.util.BiliGaiaFingerprintUtils;
 import cn.har01d.alist_tvbox.util.Constants;
 import cn.har01d.alist_tvbox.util.DashUtils;
 import cn.har01d.alist_tvbox.exception.BadRequestException;
@@ -146,6 +147,8 @@ public class BiliBiliService {
     private static final String SEASON_API = "https://api.bilibili.com/pgc/season/index/result?st=1&style_id=%s&season_version=-1&spoken_language_type=-1&area=-1&is_finish=%s&copyright=-1&season_status=-1&season_month=-1&year=%s&order=0&sort=0&page=%d&season_type=%s&pagesize=30&type=1";
     private static final String HISTORY_API = "https://api.bilibili.com/x/web-interface/history/cursor?ps=30&type=archive&business=archive&max=%s&view_at=%s";
     private static final String WATCHLATER_API = "https://api.bilibili.com/x/v2/history/toview/web";
+    private static final String WATCHLATER_ADD_API = "https://api.bilibili.com/x/v2/history/toview/add";
+    private static final String WATCHLATER_DEL_API = "https://api.bilibili.com/x/v2/history/toview/del";
     private static final String PLAY_API1 = "https://api.bilibili.com/pgc/player/web/playurl?avid=%s&cid=%s&ep_id=%s&qn=127&type=&otype=json&fourk=1&fnver=0&fnval=%d"; //dash
     private static final String PLAY_API = "https://api.bilibili.com/x/player/wbi/playurl";
     private static final String PLAY_API_NOT_DASH = "https://api.bilibili.com/x/player/wbi/playurl";
@@ -167,11 +170,24 @@ public class BiliBiliService {
     private static final String COINS_API = "https://api.bilibili.com/x/web-interface/archive/coins?aid=%s";
     private static final String FAVOURED_API = "https://api.bilibili.com/x/v2/fav/video/favoured?aid=%s";
     private static final String FAV_FOLDER_API = "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=%s&type=2&rid=%s";
-    /** TVBox 详情点赞/投币/收藏条目 id 前缀(载荷 aid,条目并入首线路),与追剧 msubstat-/msubcheck- 家族同款形态 */
+    private static final String FINGER_SPI_API = "https://api.bilibili.com/x/frontend/finger/spi";
+    private static final String GAIA_REPORT_API = "https://api.bilibili.com/x/internal/gaia-gateway/ExClimbWuzhi";
+    /** TVBox 详情点赞/投币/收藏/稍后再看条目 id 前缀(载荷 aid,条目并入首线路),与追剧 msubstat-/msubcheck- 家族同款形态 */
     public static final String BILI_STAT_PLAY_PREFIX = "bilistat-";
     public static final String BILI_LIKE_PLAY_PREFIX = "bililike-";
     public static final String BILI_COIN_PLAY_PREFIX = "bilicoin-";
     public static final String BILI_FAV_PLAY_PREFIX = "bilifav-";
+    public static final String BILI_WATCH_PLAY_PREFIX = "biliwatch-";
+
+    /** @return 播放参数是否为 B站详情动作条目 id(任一动作前缀);新增动作前缀须同步收录。 */
+    public static boolean isActionPlayId(String value) {
+        if (StringUtils.isBlank(value)) {
+            return false;
+        }
+        return value.startsWith(BILI_STAT_PLAY_PREFIX) || value.startsWith(BILI_LIKE_PLAY_PREFIX)
+                || value.startsWith(BILI_COIN_PLAY_PREFIX) || value.startsWith(BILI_FAV_PLAY_PREFIX)
+                || value.startsWith(BILI_WATCH_PLAY_PREFIX);
+    }
     public static final String RELATED_API = "https://api.bilibili.com/x/web-interface/archive/related?bvid=%s";
     // dynamic/region 已被 B 站下线(-404),改走 newlist:结构同为 data.archives,仅认主分区 rid,且 page.count 恒 0
     public static final String REGION_API = "https://api.bilibili.com/x/web-interface/newlist?ps=%d&rid=%s&pn=%d&type=0";
@@ -365,17 +381,19 @@ public class BiliBiliService {
         List<String> channelOffsets = new ArrayList<>();
     }
 
-    /** 详情动作(点赞/投币/收藏)状态:has/like 等接口有近期窗口与同步延迟,点击瞬间的重查可能和
+    /** 详情动作(点赞/投币/收藏/稍后再看)状态:has/like 等接口有近期窗口与同步延迟,点击瞬间的重查可能和
      *  加载时(客户端按钮所见)不一致,导致首次点击方向反了、要点两次 —— 翻转方向一律取加载时快照。 */
     static final class ActionState {
         final boolean liked;
         final int coins;
         final boolean favoured;
+        final boolean watchLater;
 
-        ActionState(boolean liked, int coins, boolean favoured) {
+        ActionState(boolean liked, int coins, boolean favoured, boolean watchLater) {
             this.liked = liked;
             this.coins = coins;
             this.favoured = favoured;
+            this.watchLater = watchLater;
         }
     }
 
@@ -398,6 +416,12 @@ public class BiliBiliService {
     private volatile String subKey;
     private volatile LocalDate keyTime;
     private volatile String cachedBuvid3;
+    /** 指纹建档失败后的重试门限(epoch 毫秒):建档挂在请求热路径上,失败退避防每个请求都重试上游 */
+    private volatile long gaiaEnrollRetryAfter;
+    /** bili_ticket 获取失败后的重试门限(epoch 毫秒) */
+    private volatile long biliTicketRetryAfter;
+    /** 当前扫码登录使用的匿名设备指纹(generate/poll 共享同一设备上下文;登录成功后合并落库) */
+    private volatile String pendingDeviceCookie;
 
     public BiliBiliService(SettingRepository settingRepository,
                            NavigationService navigationService,
@@ -487,7 +511,11 @@ public class BiliBiliService {
     }
 
     public QrCode scanLogin() throws IOException {
-        QrCode qrCode = restTemplate.getForObject("https://passport.bilibili.com/x/passport-login/web/qrcode/generate", BiliBiliQrCodeResponse.class).getData();
+        // 生成二维码须带设备指纹上下文:裸请求签发的会话会被风控标记为「无设备上下文」,
+        // 登录后点赞/投币等写操作稳定 -403 账号异常(2026-10 变体矩阵实验实证,cookie 字段事后补救无效)
+        HttpHeaders headers = loginDeviceHeaders();
+        QrCode qrCode = restTemplate.exchange("https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
+                HttpMethod.GET, new HttpEntity<>(null, headers), BiliBiliQrCodeResponse.class).getBody().getData();
         qrCode.setImage(Utils.getQrCode(qrCode.getUrl()));
         log.debug("{}", qrCode);
         return qrCode;
@@ -496,7 +524,8 @@ public class BiliBiliService {
     public int checkLogin(String key) {
         String url = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=" + key;
         log.debug("{}", url);
-        ResponseEntity<BiliBiliLoginResponse> response = restTemplate.getForEntity(url, BiliBiliLoginResponse.class);
+        ResponseEntity<BiliBiliLoginResponse> response = restTemplate.exchange(url, HttpMethod.GET,
+                new HttpEntity<>(null, loginDeviceHeaders()), BiliBiliLoginResponse.class);
         if (response.getBody() != null && response.getBody().getData() != null) {
             QrCodeResult result = response.getBody().getData();
             log.debug("checkLogin: {}", result);
@@ -505,17 +534,40 @@ public class BiliBiliService {
                 if (StringUtils.isNotBlank(result.getRefresh_token())) {
                     log.info("扫码登录成功");
                     String cookie = response.getHeaders().get("set-cookie").stream().map(e -> e.split(";")[0]).collect(Collectors.joining(";"));
-                    cookie = BiliCookieRefreshUtils.ensureBuvid3(cookie);
+                    // 会话 cookie 与登录时的设备上下文合并(poll 裸请求签发的会话无设备绑定,写操作会被风控拒)
+                    String deviceContext = loginDeviceHeaders().getFirst(HttpHeaders.COOKIE);
+                    if (StringUtils.isNotBlank(deviceContext)) {
+                        List<String> deviceEntries = new ArrayList<>();
+                        for (String entry : deviceContext.split(";")) {
+                            String name = entry.trim().split("=", 2)[0].trim();
+                            if (name.equals("SESSDATA") || name.equals("bili_jct") || name.equals("DedeUserID")
+                                    || name.equals("DedeUserID__ckMd5") || name.equals("sid")) {
+                                continue;
+                            }
+                            deviceEntries.add(entry.trim());
+                        }
+                        cookie = BiliCookieRefreshUtils.mergeCookieHeader(cookie, deviceEntries);
+                    }
+                    // 浏览器扫码流程 poll 成功后会请求 crossDomain URL 完成跨域收尾(落地 www 域补充 cookie 如 bp_t_offset)
+                    if (StringUtils.isNotBlank(result.getUrl())) {
+                        try {
+                            HttpHeaders cdHeaders = new HttpHeaders();
+                            cdHeaders.set(HttpHeaders.USER_AGENT, BiliGaiaFingerprintUtils.USER_AGENT);
+                            cdHeaders.set(HttpHeaders.COOKIE, cookie);
+                            ResponseEntity<Void> crossDomain = restTemplate.exchange(result.getUrl(), HttpMethod.GET, new HttpEntity<>(null, cdHeaders), Void.class);
+                            List<String> setCookies = crossDomain.getHeaders().get(HttpHeaders.SET_COOKIE);
+                            if (setCookies != null && !setCookies.isEmpty()) {
+                                cookie = BiliCookieRefreshUtils.mergeCookieHeader(cookie, setCookies);
+                            }
+                        } catch (Exception e) {
+                            log.warn("B站 crossDomain 收尾失败: {}", e.getMessage());
+                        }
+                    }
+                    // 设备上下文已并入,这里兜底建档查漏 + 换 bili_ticket(写操作风控因子)
+                    cookie = ensureDeviceProfile(cookie, true);
+                    pendingDeviceCookie = null;
                     settingRepository.save(new Setting(BILIBILI_COOKIE, cookie));
                     settingRepository.save(new Setting(BILIBILI_TOKEN, result.getRefresh_token()));
-//                    try {
-//                        HttpEntity<Void> entity = buildHttpEntity(null);
-//                        var body = restTemplate.exchange("https://api.bilibili.com/x/frontend/finger/spi", HttpMethod.GET, entity, JsonNode.class).getBody();
-//                        cookie += ";buvid3=" + body.get("data").get("b_3").asText() + ";buvid4=" + body.get("data").get("b_4").asText();
-//                        settingRepository.save(new Setting(BILIBILI_COOKIE, cookie));
-//                    } catch (Exception e) {
-//                        log.warn("get buvid3 failed", e);
-//                    }
                     return code;
                 }
             } else if (code == 86038) {
@@ -1848,7 +1900,7 @@ public class BiliBiliService {
         BiliBiliInfo info = cache.get(bvid);
         MovieDetail movieDetail = getMovieDetail(info, client, true);
 
-        // 点赞/投币/收藏条目(「互动状态」零副作用占位守在动作之前,防自动下一集/误按直接撞上有副作用的动作;
+        // 点赞/投币/收藏/稍后再看条目(「互动状态」零副作用占位守在动作之前,防自动下一集/误按直接撞上有副作用的动作;
         // gui/atv-player 不下发,动作按钮由 getPlayUrl 的 actions 键下发)。默认并入第一条 BiliBili 线路
         // (视频条目之后 # 追加,选集网格直接可见,OK影视等内核自动下一集不跨线路、不会越界打断相关视频连播);
         // 开关 bilibili_action_separate_line=true 时单独「操作」线路,置于线路末位(相关视频/UP主视频之后)
@@ -1859,7 +1911,8 @@ public class BiliBiliService {
             biliActions = "互动状态$" + BILI_STAT_PLAY_PREFIX + actionAid
                     + "#点赞$" + BILI_LIKE_PLAY_PREFIX + actionAid
                     + "#投币$" + BILI_COIN_PLAY_PREFIX + actionAid
-                    + "#收藏$" + BILI_FAV_PLAY_PREFIX + actionAid;
+                    + "#收藏$" + BILI_FAV_PLAY_PREFIX + actionAid
+                    + "#稍后再看$" + BILI_WATCH_PLAY_PREFIX + actionAid;
             if (!separateActionLine) {
                 movieDetail.setVod_play_url(movieDetail.getVod_play_url() + "#" + biliActions);
             }
@@ -2147,14 +2200,15 @@ public class BiliBiliService {
             headers.set(entry.getKey(), entry.getValue());
         }
         String cookie = settingRepository.findById(BILIBILI_COOKIE).map(Setting::getValue).orElse("");
-        if (StringUtils.isBlank(cookie) || BILIBILI_CODE.equals(cookie)) {
-            cookie = getCookie(cookie);
-        } else {
+        boolean own = StringUtils.isNotBlank(cookie) && !BILIBILI_CODE.equals(cookie);
+        if (own) {
             String refreshed = biliCookieRefreshService.refreshIfNeeded(cookie);
             cookie = refreshed == null ? cookie : refreshed;
+        } else {
+            cookie = getCookie(cookie);
         }
-        // 点赞/投币/收藏等风控校验要求真实 buvid3,缺失时统一在此补齐(进程内缓存)
-        headers.set(HttpHeaders.COOKIE, ensureBuvid3(cookie.trim()));
+        // 点赞/投币/收藏等风控校验要求设备指纹已在服务端建档(未建档=buvid3 裸值被拒 -403),缺失时统一在此建档
+        headers.set(HttpHeaders.COOKIE, ensureDeviceProfile(cookie.trim(), own));
         return new HttpEntity<>(data, headers);
     }
 
@@ -2339,7 +2393,7 @@ public class BiliBiliService {
         result.put("danmaku", "https://comment.bilibili.com/" + cid + ".xml");
 
         if ("gui".equals(client)) {
-            // atv-player 详情动作(点赞/投币/收藏):三个状态查询并发,失败兜底默认态不影响播放
+            // atv-player 详情动作(点赞/投币/收藏/稍后再看):状态查询并发,失败兜底默认态不影响播放
             java.util.concurrent.CompletableFuture<List<Map<String, Object>>> actionsFuture =
                     java.util.concurrent.CompletableFuture.supplyAsync(() -> getActions(aid));
             result.put("actions", actionsFuture.join());
@@ -2428,7 +2482,7 @@ public class BiliBiliService {
         return list;
     }
 
-    /** 详情动作(点赞/投币/收藏)按钮清单:未登录(无 csrf)禁用并提示;状态查询失败兜底默认态。 */
+    /** 详情动作(点赞/投币/收藏/稍后再看)按钮清单:未登录(无 csrf)禁用并提示;状态查询失败兜底默认态。 */
     List<Map<String, Object>> getActions(String aid) {
         List<Map<String, Object>> actions = new ArrayList<>();
         String cookie = resolveCookie();
@@ -2437,6 +2491,7 @@ public class BiliBiliService {
             actions.add(action("like", "like", "点赞", false, false, "未登录 B站,请先在设置中配置 Cookie"));
             actions.add(action("coin", "coin", "投币", false, false, "未登录 B站,请先在设置中配置 Cookie"));
             actions.add(action("favorite", "favorite", "收藏", false, false, "未登录 B站,请先在设置中配置 Cookie"));
+            actions.add(action("watchlater", "watchlater", "稍后再看", false, false, "未登录 B站,请先在设置中配置 Cookie"));
             return actions;
         }
         // 探针:SESSDATA 失效(如内置共享 cookie 过期)上游回 -101,按钮禁用提示更新而非可点必败
@@ -2445,26 +2500,32 @@ public class BiliBiliService {
             actions.add(action("like", "like", "点赞", false, false, "B站账号未登录或已过期,请更新 Cookie"));
             actions.add(action("coin", "coin", "投币", false, false, "B站账号未登录或已过期,请更新 Cookie"));
             actions.add(action("favorite", "favorite", "收藏", false, false, "B站账号未登录或已过期,请更新 Cookie"));
+            actions.add(action("watchlater", "watchlater", "稍后再看", false, false, "B站账号未登录或已过期,请更新 Cookie"));
             return actions;
         }
         var coinFuture = java.util.concurrent.CompletableFuture.supplyAsync(() -> coinCount(aid));
         var favFuture = java.util.concurrent.CompletableFuture.supplyAsync(() -> isFavoured(aid));
+        var watchLaterFuture = java.util.concurrent.CompletableFuture.supplyAsync(() -> isInWatchLater(aid));
         boolean liked = likeNode != null && likeNode.path("data").asInt(0) == 1;
         int coins = coinFuture.join();
         boolean favoured = favFuture.join();
+        boolean watchLater = watchLaterFuture.join();
 
-        actionStates.put(aid, new ActionState(liked, coins, favoured));
+        actionStates.put(aid, new ActionState(liked, coins, favoured, watchLater));
         // 状态入文案 + icon 字段(客户端按 active 切换 filled/outline 图标),点击后即时可见
-        return buildActions(liked, coins, favoured);
+        return buildActions(liked, coins, favoured, watchLater);
     }
 
-    private List<Map<String, Object>> buildActions(boolean liked, int coins, boolean favoured) {
+    private List<Map<String, Object>> buildActions(boolean liked, int coins, boolean favoured, boolean watchLater) {
         List<Map<String, Object>> actions = new ArrayList<>();
         actions.add(action("like", "like", liked ? "已点赞" : "点赞", liked, true, liked ? "已点赞,点击取消" : "点赞"));
         actions.add(action("coin", "coin", coins > 0 ? "已投币×" + coins : "投币", coins > 0, coins < 2,
                 coins <= 0 ? "投 1 枚硬币" : "已投 " + coins + "/2 枚" + (coins < 2 ? ",点击再投 1 枚" : "")));
         actions.add(action("favorite", "favorite", favoured ? "已收藏" : "收藏", favoured, true,
                 favoured ? "已收藏(默认收藏夹),点击取消" : "收藏到默认收藏夹"));
+        // 「稍后再看」是列表名非动词,active 态沿用原标签(B站 web 同款),选中色/填充图标表达状态
+        actions.add(action("watchlater", "watchlater", "稍后再看", watchLater, true,
+                watchLater ? "已加入稍后再看,点击移出" : "加入稍后再看列表(上限 100 个)"));
         return actions;
     }
 
@@ -2481,7 +2542,7 @@ public class BiliBiliService {
         return map;
     }
 
-    /** atv-player 详情动作入口:点赞(toggle)/投币(+1,上限 2)/收藏(toggle 默认收藏夹);返回刷新后的完整按钮清单。 */
+    /** atv-player 详情动作入口:点赞(toggle)/投币(+1,上限 2)/收藏(toggle 默认收藏夹)/稍后再看(toggle);返回刷新后的完整按钮清单。 */
     public Map<String, Object> runAction(String vodId, String action) {
         String aid = resolveAid(vodId);
         String cookie = resolveCookie();
@@ -2491,23 +2552,25 @@ public class BiliBiliService {
         }
         // 翻转方向取加载时快照(客户端按钮所见):点击瞬间重查状态接口可能抖动出相反值,
         // 方向反了就表现为"要点两次";动作成功后的状态由动作本身推导并回写快照
-        ActionState state = actionStates.get(aid, k -> new ActionState(hasLiked(aid), coinCount(aid), isFavoured(aid)));
+        ActionState state = actionStates.get(aid, k -> new ActionState(hasLiked(aid), coinCount(aid), isFavoured(aid), isInWatchLater(aid)));
         boolean liked = state.liked;
         int coins = state.coins;
         boolean favoured = state.favoured;
+        boolean watchLater = state.watchLater;
         switch (StringUtils.defaultString(action)) {
             case "like" -> liked = like(aid, csrf, liked);
             case "coin" -> coins = coin(aid, csrf, coins);
             case "favorite" -> favoured = favorite(aid, cookie, csrf, favoured);
+            case "watchlater" -> watchLater = toggleWatchLater(aid, csrf, watchLater);
             default -> throw new BadRequestException("未知详情动作: " + action);
         }
-        actionStates.put(aid, new ActionState(liked, coins, favoured));
+        actionStates.put(aid, new ActionState(liked, coins, favoured, watchLater));
         Map<String, Object> result = new HashMap<>();
-        result.put("actions", buildActions(liked, coins, favoured));
+        result.put("actions", buildActions(liked, coins, favoured, watchLater));
         return result;
     }
 
-    /** TVBox「操作」线路「点赞/投币/收藏」的 msg 回执文案:新状态由动作结果推导(runAction 成功必回写快照),不回查有延迟的状态接口。 */
+    /** TVBox「操作」线路「点赞/投币/收藏/稍后再看」的 msg 回执文案:新状态由动作结果推导(runAction 成功必回写快照),不回查有延迟的状态接口。 */
     public String runActionText(String vodId, String action) {
         runAction(vodId, action);
         ActionState state = actionStates.getIfPresent(resolveAid(vodId));
@@ -2518,15 +2581,16 @@ public class BiliBiliService {
             case "like" -> state.liked ? "点赞成功" : "已取消点赞";
             case "coin" -> "投币成功: 已投 " + state.coins + "/2 枚";
             case "favorite" -> state.favoured ? "收藏成功(默认收藏夹)" : "已取消收藏";
+            case "watchlater" -> state.watchLater ? "已加入稍后再看" : "已移出稍后再看";
             default -> "操作已执行";
         };
     }
 
-    /** TVBox「操作」线路首条「互动状态」:零副作用,msg 回显点赞/投币/收藏当前状态;未登录/过期回显原因。 */
+    /** TVBox「操作」线路首条「互动状态」:零副作用,msg 回显点赞/投币/收藏/稍后再看当前状态;未登录/过期回显原因。 */
     public String getActionStatusText(String vodId) {
         String aid = resolveAid(vodId);
         List<Map<String, Object>> actions = getActions(aid);
-        // 未登录/过期分支:三钮禁用且 tooltip 即原因(不落快照,不能读旧快照冒充当前状态)
+        // 未登录/过期分支:按钮禁用且 tooltip 即原因(不落快照,不能读旧快照冒充当前状态)
         if (!Boolean.TRUE.equals(actions.get(0).get("enabled"))) {
             return String.valueOf(actions.get(0).getOrDefault("tooltip", "当前状态不可用"));
         }
@@ -2536,7 +2600,8 @@ public class BiliBiliService {
         }
         return "点赞: " + (state.liked ? "已点赞" : "未点赞")
                 + "  投币: " + (state.coins > 0 ? "已投 " + state.coins + "/2 枚" : "未投币")
-                + "  收藏: " + (state.favoured ? "已收藏" : "未收藏");
+                + "  收藏: " + (state.favoured ? "已收藏" : "未收藏")
+                + "  稍后再看: " + (state.watchLater ? "已加入" : "未加入");
     }
 
     /**
@@ -2893,12 +2958,10 @@ public class BiliBiliService {
     private String resolveCookie() {
         String cookie = settingRepository.findById(BILIBILI_COOKIE).map(Setting::getValue).orElse("");
         if (StringUtils.isBlank(cookie) || BILIBILI_CODE.equals(cookie)) {
-            cookie = getCookie(cookie);
-        } else {
-            String refreshed = biliCookieRefreshService.refreshIfNeeded(cookie);
-            cookie = refreshed == null ? cookie : refreshed;
+            return ensureDeviceProfile(getCookie(cookie).trim(), false);
         }
-        return ensureBuvid3(cookie.trim());
+        String refreshed = biliCookieRefreshService.refreshIfNeeded(cookie);
+        return ensureDeviceProfile((refreshed == null ? cookie : refreshed).trim(), true);
     }
 
     /** 点赞/投币/收藏的风控校验要求 Cookie 携带真实 buvid3:缺失时经 getbuvid 取真值(进程内缓存),失败退随机值。 */
@@ -2920,6 +2983,161 @@ public class BiliBiliService {
             return cookie + "; buvid3=" + cachedBuvid3;
         }
         return BiliCookieRefreshUtils.ensureBuvid3(cookie);
+    }
+
+    /**
+     * 扫码登录链路(generate/poll)的设备上下文头:已配置 Cookie 时沿用其设备字段(老设备信任更高),
+     * 未配置时匿名建档一套纯设备指纹("buvid3=" 哨兵触发 spi+建档,persist=false 不落库,暂存内存供 poll 复用)。
+     */
+    private HttpHeaders loginDeviceHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.USER_AGENT, BiliGaiaFingerprintUtils.USER_AGENT);
+        headers.set(HttpHeaders.REFERER, "https://www.bilibili.com/");
+        headers.set("Origin", "https://www.bilibili.com");
+        String cookie = settingRepository.findById(BILIBILI_COOKIE).map(Setting::getValue).orElse("");
+        if (StringUtils.isNotBlank(cookie) && !BILIBILI_CODE.equals(cookie)) {
+            cookie = ensureDeviceProfile(cookie.trim(), false);
+        } else {
+            if (StringUtils.isBlank(pendingDeviceCookie)) {
+                pendingDeviceCookie = ensureDeviceProfile("buvid3=", false);
+            }
+            cookie = pendingDeviceCookie;
+        }
+        if (StringUtils.isNotBlank(cookie)) {
+            headers.set(HttpHeaders.COOKIE, cookie);
+        }
+        return headers;
+    }
+
+    /**
+     * 确保写操作(点赞/投币/收藏/分享)的风控因子齐备:①设备指纹在 B站服务端建档(ExClimbWuzhi);
+     * ②bili_ticket(Web 端票据,浏览器 Cookie 常态字段,缺失显著提高 -403 概率,2026-10 起 4567 实测必需)。
+     *
+     * @param persist true=用户自有 Cookie(结果写回设置);false=内置共享 Cookie(只随本次请求,不落库)
+     */
+    private synchronized String ensureDeviceProfile(String cookie, boolean persist) {
+        return ensureBiliTicket(ensureGaiaProfile(cookie, persist), persist);
+    }
+
+    private String ensureGaiaProfile(String cookie, boolean persist) {
+        if (StringUtils.isBlank(cookie)) {
+            return cookie;
+        }
+        String buvid3 = BiliCookieRefreshUtils.getCookieValue(cookie, "buvid3");
+        String buvid4 = BiliCookieRefreshUtils.getCookieValue(cookie, "buvid4");
+        String bNut = BiliCookieRefreshUtils.getCookieValue(cookie, "b_nut");
+        String uuid = BiliCookieRefreshUtils.getCookieValue(cookie, "_uuid");
+        String buvidFp = BiliCookieRefreshUtils.getCookieValue(cookie, "buvid_fp");
+        String bLsid = BiliCookieRefreshUtils.getCookieValue(cookie, "b_lsid");
+        if (StringUtils.isNotBlank(buvid3) && StringUtils.isNotBlank(uuid) && StringUtils.isNotBlank(buvidFp)) {
+            return cookie;
+        }
+        if (System.currentTimeMillis() < gaiaEnrollRetryAfter) {
+            return ensureBuvid3(cookie);
+        }
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.set(HttpHeaders.USER_AGENT, BiliGaiaFingerprintUtils.USER_AGENT);
+            headers.set(HttpHeaders.REFERER, "https://www.bilibili.com/");
+            headers.set("Origin", "https://www.bilibili.com");
+            if (StringUtils.isBlank(buvid3)) {
+                JsonNode spi = restTemplate.exchange(FINGER_SPI_API, HttpMethod.GET, new HttpEntity<>(null, headers), JsonNode.class).getBody();
+                buvid3 = spi.path("data").path("b_3").asText("");
+                buvid4 = spi.path("data").path("b_4").asText("");
+            }
+            if (StringUtils.isBlank(buvid3)) {
+                throw new IllegalStateException("finger/spi 未返回 buvid3");
+            }
+            String deviceUuid = StringUtils.isNotBlank(uuid) ? uuid : BiliGaiaFingerprintUtils.generateDeviceUuid();
+            List<String> deviceCookies = new ArrayList<>();
+            deviceCookies.add("buvid3=" + buvid3);
+            if (StringUtils.isNotBlank(buvid4)) {
+                deviceCookies.add("buvid4=" + buvid4);
+            }
+            deviceCookies.add("b_nut=" + (StringUtils.isNotBlank(bNut) ? bNut : System.currentTimeMillis() / 1000));
+            deviceCookies.add("_uuid=" + deviceUuid);
+            if (StringUtils.isBlank(buvidFp)) {
+                deviceCookies.add("buvid_fp=" + BiliGaiaFingerprintUtils.computeBuvidFp(buvid3));
+            }
+            if (StringUtils.isBlank(bLsid)) {
+                deviceCookies.add("b_lsid=" + BiliGaiaFingerprintUtils.generateBLsid());
+            }
+            deviceCookies.addAll(BiliGaiaFingerprintUtils.pageBehaviorCookies().stream()
+                    .filter(entry -> StringUtils.isBlank(BiliCookieRefreshUtils.getCookieValue(cookie, entry.split("=", 2)[0])))
+                    .toList());
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.set(HttpHeaders.COOKIE, String.join("; ", deviceCookies));
+            JsonNode response = restTemplate.exchange(GAIA_REPORT_API, HttpMethod.POST,
+                    new HttpEntity<>(BiliGaiaFingerprintUtils.buildPayload(deviceUuid), headers), JsonNode.class).getBody();
+            if (response == null || response.path("code").asInt(-1) != 0) {
+                log.warn("B站设备指纹建档失败: {}", response == null ? "空响应" : response.path("code") + " " + response.path("message"));
+                gaiaEnrollRetryAfter = System.currentTimeMillis() + Duration.ofMinutes(10).toMillis();
+                return ensureBuvid3(cookie);
+            }
+            String merged = BiliCookieRefreshUtils.mergeCookieHeader(cookie, deviceCookies);
+            if (persist) {
+                settingRepository.save(new Setting(BILIBILI_COOKIE, merged));
+            }
+            log.info("B站设备指纹建档成功(buvid3/buvid4/_uuid/buvid_fp/b_lsid 齐全),写操作风控 -403 应已解除");
+            return merged;
+        } catch (Exception e) {
+            log.warn("B站设备指纹建档异常: {}", e.getMessage());
+            gaiaEnrollRetryAfter = System.currentTimeMillis() + Duration.ofMinutes(10).toMillis();
+            return ensureBuvid3(cookie);
+        }
+    }
+
+    /**
+     * 补齐 bili_ticket(Web 端票据):缺指纹建档靠 ensureGaiaProfile,但能点赞的浏览器 Cookie 还常态携带
+     * bili_ticket/bili_ticket_expires(用户 4567 两份 Cookie 对比实证,2026-10)。经 GenWebTicket 换取并入 Cookie,
+     * 过期前 5 分钟外不再重复获取;失败静默退避(票据非读操作必需)。
+     */
+    private String ensureBiliTicket(String cookie, boolean persist) {
+        if (StringUtils.isBlank(cookie)) {
+            return cookie;
+        }
+        String ticket = BiliCookieRefreshUtils.getCookieValue(cookie, "bili_ticket");
+        long now = System.currentTimeMillis() / 1000;
+        if (StringUtils.isNotBlank(ticket)) {
+            String expires = BiliCookieRefreshUtils.getCookieValue(cookie, "bili_ticket_expires");
+            try {
+                if (StringUtils.isNotBlank(expires) && Long.parseLong(expires) - now > 300) {
+                    return cookie;
+                }
+            } catch (NumberFormatException ignored) {
+                // 过期值损坏按缺失处理
+            }
+        }
+        if (System.currentTimeMillis() < biliTicketRetryAfter) {
+            return cookie;
+        }
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.set(HttpHeaders.USER_AGENT, BiliGaiaFingerprintUtils.USER_AGENT);
+            headers.set(HttpHeaders.REFERER, "https://www.bilibili.com/");
+            headers.set(HttpHeaders.COOKIE, cookie);
+            String url = BiliGaiaFingerprintUtils.buildGenWebTicketUrl(
+                    BiliCookieRefreshUtils.getCookieValue(cookie, "bili_jct"), now);
+            JsonNode response = restTemplate.exchange(url, HttpMethod.POST, new HttpEntity<>(null, headers), JsonNode.class).getBody();
+            String newTicket = response == null ? "" : response.path("data").path("ticket").asText("");
+            if (StringUtils.isNotBlank(newTicket)) {
+                long expires = response.path("data").path("created_at").asLong(now)
+                        + response.path("data").path("ttl").asLong(259200);
+                String merged = BiliCookieRefreshUtils.mergeCookieHeader(cookie,
+                        List.of("bili_ticket=" + newTicket, "bili_ticket_expires=" + expires));
+                if (persist) {
+                    settingRepository.save(new Setting(BILIBILI_COOKIE, merged));
+                }
+                log.info("B站 bili_ticket 已获取并入 Cookie(写操作风控因子)");
+                return merged;
+            }
+            log.warn("B站 bili_ticket 获取失败: {}", response == null ? "空响应" : response.path("code") + " " + response.path("message"));
+            biliTicketRetryAfter = System.currentTimeMillis() + Duration.ofMinutes(10).toMillis();
+        } catch (Exception e) {
+            log.warn("B站 bili_ticket 获取异常: {}", e.getMessage());
+            biliTicketRetryAfter = System.currentTimeMillis() + Duration.ofMinutes(10).toMillis();
+        }
+        return cookie;
     }
 
     /** @return 动作成功后的新点赞状态(由方向推导,不回查延迟接口) */
@@ -2980,6 +3198,15 @@ public class BiliBiliService {
         return !currentFavoured;
     }
 
+    /** @return 动作成功后的新稍后再看状态(方向取快照;90001 列表已满等上游错误码转文案抛出)。 */
+    private boolean toggleWatchLater(String aid, String csrf, boolean currentWatchLater) {
+        MultiValueMap<String, String> form = new LinkedMultiValueMap<>();
+        form.add("aid", aid);
+        form.add("csrf", csrf);
+        postForm(currentWatchLater ? WATCHLATER_DEL_API : WATCHLATER_ADD_API, form, videoReferer(aid));
+        return !currentWatchLater;
+    }
+
     /** 浏览器从视频页发起这些操作,Referer 对齐视频页(av2bv 失败退站点根)。 */
     private String videoReferer(String aid) {
         try {
@@ -2989,11 +3216,13 @@ public class BiliBiliService {
         }
     }
 
-    /** 表单 POST 到 B站(自动携带 Cookie + urlencoded + 视频页 Referer/Origin,贴近浏览器以过风控),toleratedCodes 之外的错误抛 BadRequestException 携带上游 message。 */
+    /** 表单 POST 到 B站(自动携带 Cookie + urlencoded + 视频页 Referer/Origin,贴近浏览器以过风控),toleratedCodes 之外的错误抛 BadRequestException 携带上游 message。
+     *  UA 钉死建档模板 UA:写操作的设备档案(ExClimbWuzhi payload b8ce)与请求 UA 必须一致,随机池 UA 波动是新档案被拒 -403 的因子。 */
     private JsonNode postForm(String url, MultiValueMap<String, String> form, String referer, int... toleratedCodes) {
         HttpEntity<MultiValueMap<String, String>> entity = buildHttpEntity(form, true, new HashMap<>(Map.of(
                 HttpHeaders.REFERER, referer,
-                "Origin", "https://www.bilibili.com")));
+                "Origin", "https://www.bilibili.com",
+                HttpHeaders.USER_AGENT, BiliGaiaFingerprintUtils.USER_AGENT)));
         ResponseEntity<JsonNode> response = restTemplate.exchange(url, HttpMethod.POST, entity, JsonNode.class);
         JsonNode body = response.getBody();
         int code = body == null ? -1 : body.path("code").asInt(-1);
@@ -3031,6 +3260,20 @@ public class BiliBiliService {
     private boolean isFavoured(String aid) {
         JsonNode node = getJsonNode(String.format(FAVOURED_API, aid));
         return node != null && node.path("data").path("favoured").asBoolean(false);
+    }
+
+    /** 稍后再看列表是否已含该稿(toview/web 单接口全量≤100 条,与 getWatchLater 同源);未登录/失败兜底未加入。 */
+    private boolean isInWatchLater(String aid) {
+        JsonNode node = getJsonNode(WATCHLATER_API);
+        if (node == null || node.path("code").asInt(-1) != 0) {
+            return false;
+        }
+        for (JsonNode video : node.path("data").path("list")) {
+            if (aid.equals(video.path("aid").asText())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public String getSubtitle(String url) {
